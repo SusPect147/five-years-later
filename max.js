@@ -17,7 +17,7 @@
 (function () {
   'use strict';
 
-  var API = 'https://bsbgkdbdwqpkrzkalccv.supabase.co/functions/v1/fyl-api';
+  var API = 'https://kackzczkifqoznttniqg.supabase.co/functions/v1/fyl-api';
   var CACHE_KEY = 'fin-sim-board-cache-v1';
   var QUEUE_KEY = 'fin-sim-outbox-v1';
 
