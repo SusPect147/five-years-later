@@ -1,0 +1,27 @@
+# В репозиторий попадает только то, что перечислено ниже.
+# Всё остальное — черновики, резервные копии, локальные заметки, служебные
+# файлы редакторов — не уедет на GitHub даже случайно.
+
+/*
+
+!.gitignore
+!index.html
+!engine.js
+!events.js
+!content.js
+!ui.js
+!max.js
+!balance.js
+!engine.test.js
+!ui.test.js
+!иконка/
+!supabase/
+
+# Внутри разрешённых папок тоже есть мусор
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*~
