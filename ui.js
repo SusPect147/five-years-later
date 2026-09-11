@@ -285,6 +285,7 @@
    */
 
   var ICONS = {
+    user: '<circle cx="12" cy="8.6" r="3.6"/><path d="M5 19.4c1-3 3.6-4.6 7-4.6s6 1.6 7 4.6"/>',
     help: '<circle cx="12" cy="12" r="9"/><path d="M9.6 9.2a2.5 2.5 0 1 1 3.4 2.4c-.7.3-1 .9-1 1.6v.4"/><path d="M12 17.2h.01"/>',
     gear: '<path d="M4 7.5h9M17 7.5h3M4 16.5h3M11 16.5h9"/><circle cx="15" cy="7.5" r="2.4"/><circle cx="9" cy="16.5" r="2.4"/>',
     arrow: '<path d="M4.5 12h14"/><path d="M13 6.5 18.5 12 13 17.5"/>',
@@ -658,7 +659,6 @@
 
   var SPLASH_MONTHS = 60;      // месяцев в партии
   var SPLASH_YEARS = 5;        // и лет соответственно
-  var SPLASH_BUILD_MS = 2900;  // сколько «идут» пять лет
   var SPLASH_HOLD_MS = 1800;   // сколько экран ждёт игрока после «Готово»
 
   function renderSplash() {
@@ -808,11 +808,69 @@
 
     /* Журнал сборки: показывает, что именно собирается */
 
+    /*
+     * Шкала показывает не прошедшее время, а реально сделанную работу.
+     * Каждая задача честно что-то грузит или считает: сборка сценариев
+     * из пула событий, прогрев цен, ответ сервера. Вес — грубая оценка
+     * доли, чтобы полоса двигалась ровно, а не рывком в конце.
+     */
     var steps = [
-      { at: .00, text: 'Собираем сценарии' },
-      { at: .30, text: 'Раскладываем события по месяцам' },
-      { at: .62, text: 'Считаем рынок и цены' },
-      { at: .92, text: 'Партия готова' }
+      {
+        text: 'Проверяем шрифты',
+        weight: 0.6,
+        run: function (progress, ready) {
+          if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+            document.fonts.ready.then(ready, ready);
+          } else ready();
+        }
+      },
+      {
+        text: 'Собираем сценарии',
+        weight: 5,
+        run: function (progress, ready) {
+          // Порциями по 12 мс: экран продолжает отрисовываться.
+          var list = C.scenarios || [], i = 0;
+          function chunk() {
+            var t0 = Date.now();
+            while (i < list.length && Date.now() - t0 < 12) {
+              try { E.resolveScenario(list[i], C.pool, 'warmup-' + list[i].id); } catch (e) { }
+              i++;
+            }
+            progress(list.length ? i / list.length : 1);
+            if (i < list.length) setTimeout(chunk, 0); else ready();
+          }
+          chunk();
+        }
+      },
+      {
+        text: 'Считаем рынок и цены',
+        weight: 1.4,
+        run: function (progress, ready) {
+          var list = C.instruments || [];
+          list.forEach(function (inst, k) {
+            for (var m = 0; m < SPLASH_MONTHS; m++) {
+              try { E.priceAt('warmup', 'warmup-seed', inst.id, m); } catch (e) { }
+            }
+            progress((k + 1) / (list.length || 1));
+          });
+          ready();
+        }
+      },
+      {
+        text: 'Связь с сервером',
+        weight: 3,
+        run: function (progress, ready, row) {
+          var boot = window.FylBoot;
+          if (!boot || !boot.then) {
+            // Игра открыта вне MAX — сервера просто нет, и это не ошибка.
+            var txt = row && row.querySelector('.slog-txt');
+            if (txt) txt.textContent = 'Готово к игре';
+            ready();
+            return;
+          }
+          boot.then(ready, ready);
+        }
+      }
     ];
     var log = el('div', 'splash-log');
     var rows = steps.map(function (st) {
@@ -855,10 +913,6 @@
     var buildTimer = 0;
     var hotTimers = [];
 
-    // Ход времени почти ровный: резкий easeOut съедал первые годы
-    // за первые кадры, и счётчик успевал долететь до пятёрки раньше шкалы.
-    function easeOut(p) { return 1 - Math.pow(1 - p, 1.6); }
-
     function apply(p) {
       if (p < 0) p = 0; else if (p > 1) p = 1;
 
@@ -896,14 +950,6 @@
       }
       head.style.left = 'calc(' + (p * 100) + '% - 0.5px)';
 
-      // Журнал: активная строка одна, предыдущие отмечены галочкой
-      for (var s = 0; s < steps.length; s++) {
-        if (p >= steps[s].at && s > doneStep) {
-          if (rows[s - 1]) rows[s - 1].classList.add('done');
-          rows[s].classList.add('on');
-          doneStep = s;
-        }
-      }
     }
 
     var finished = false;
@@ -922,27 +968,104 @@
       autoTimer = setTimeout(leaveSplash, SPLASH_HOLD_MS);
     }
 
-    if (reduced) {
-      // «Меньше движения»: экран тот же, но собран сразу.
-      finish();
-    } else if (window.requestAnimationFrame) {
-      var t0 = 0;
-      var tick = function (now) {
+    /* Привод шкалы: цель — доля выполненной работы, а не время. */
+
+    var totalWeight = 0;
+    for (var wI = 0; wI < steps.length; wI++) totalWeight += steps[wI].weight;
+    var loadedWeight = 0;
+    var shown = 0;
+    var allDone = false;
+    var startedAt = Date.now();
+    var MIN_MS = 2200;     // чтобы на быстром устройстве экран не мигнул
+    var MAX_MS = 9000;     // и не завис, если что-то не отвечает
+
+    // Доля шкалы, на которой заканчивается каждый шаг: журнал и полоса
+    // должны идти в ногу, иначе галочки стоят у ещё не заполненной шкалы.
+    var stepEdge = [];
+    (function () {
+      var acc = 0;
+      for (var i = 0; i < steps.length; i++) {
+        acc += steps[i].weight;
+        stepEdge.push(totalWeight ? acc / totalWeight : 1);
+      }
+    })();
+    var stepDone = [];
+
+    function paintLog() {
+      var active = -1;
+      for (var i = 0; i < rows.length; i++) {
+        if (stepDone[i] && shown >= stepEdge[i] - 0.001) {
+          rows[i].classList.add('done');
+        } else if (active < 0) {
+          active = i;
+        }
+      }
+      if (active >= 0) {
+        rows[active].classList.add('on');
+        doneStep = active;
+      }
+    }
+
+    function runStep(i) {
+      if (done) return;
+      if (i >= steps.length) {
+        allDone = true;
+        if (reduced) finish();
+        return;
+      }
+      var st = steps[i];
+      rows[i].classList.add('on');
+
+      var base = loadedWeight;
+      var settled = false;
+      // Ни одна задача не имеет права держать экран дольше своего лимита.
+      var guard = setTimeout(function () { ready(); }, 6000);
+      hotTimers.push(guard);
+
+      function progress(frac) {
+        if (settled) return;
+        var f = frac < 0 ? 0 : (frac > 1 ? 1 : frac);
+        loadedWeight = base + st.weight * f;
+      }
+      function ready() {
+        if (settled) return;
+        settled = true;
+        clearTimeout(guard);
+        loadedWeight = base + st.weight;
+        stepDone[i] = true;
+        runStep(i + 1);
+      }
+
+      try { st.run(progress, ready, rows[i]); } catch (e) { ready(); }
+    }
+
+    if (window.requestAnimationFrame && !reduced) {
+      var frameStep = function () {
         if (done || finished) return;
-        var p = (now - t0) / SPLASH_BUILD_MS;
-        apply(easeOut(Math.min(1, p)));
-        if (p < 1) raf = requestAnimationFrame(tick);
-        else finish();
+        // Полоса показывает меньшее из двух: сколько работы сделано и
+        // сколько прошло времени. Так она не скачет до конца на быстром
+        // устройстве и не врёт на медленном — просто ждёт настоящую работу.
+        var elapsedNow = Date.now() - startedAt;
+        var work = totalWeight ? loadedWeight / totalWeight : 1;
+        var pace = elapsedNow / MIN_MS;
+        var target = work < pace ? work : pace;
+        shown += (target - shown) * 0.16;
+        if (target - shown < 0.004) shown = target;
+        apply(shown);
+        paintLog();
+        var elapsed = Date.now() - startedAt;
+        if (allDone && shown > 0.995 && elapsed >= MIN_MS) { finish(); return; }
+        if (elapsed > MAX_MS) { finish(); return; }
+        raf = requestAnimationFrame(frameStep);
       };
-      raf = requestAnimationFrame(function (now) {
-        t0 = now;
-        tick(now);
-      });
-      // Страховка: во вкладке в фоне requestAnimationFrame останавливается,
-      // и без таймера игрок вернулся бы к недособранной заставке.
-      buildTimer = setTimeout(finish, SPLASH_BUILD_MS + 150);
+      runStep(0);
+      raf = requestAnimationFrame(frameStep);
+      // Страховка: в фоновой вкладке requestAnimationFrame останавливается.
+      buildTimer = setTimeout(finish, MAX_MS + 500);
     } else {
-      finish();   // очень старый движок — просто показываем готовый экран
+      // «Меньше движения» или очень старый движок: работа та же, без анимации.
+      runStep(0);
+      buildTimer = setTimeout(finish, MAX_MS);
     }
 
     /* Лёгкий параллакс: экран отзывается на курсор */
@@ -2727,16 +2850,19 @@
     about.onclick = function () { MaxBridge.haptic('light'); renderAbout(); };
     nav.appendChild(about);
 
-    // Профиль/прогресс — компактное кольцо с долей открытых карточек
+    // Профиль: кольцо с долей открытых карточек плюс вход в свою карточку
     var total = Object.keys(C.concepts).length;
     var opened = Store.data.concepts.length;
-    var prof = el('div', 'app-profile');
-    prof.setAttribute('title', 'Открыто карточек знаний: ' + opened + ' из ' + total);
+    var prof = el('button', 'app-profile');
+    prof.setAttribute('aria-label', 'Профиль игрока');
+    prof.setAttribute('title', 'Профиль: рекорды, место в таблице, прогресс');
+    prof.appendChild(icon('user', 'ap-icon'));
     prof.appendChild(buildRing(total ? opened / total : 0));
     var pm = el('div', 'ap-meta');
     pm.appendChild(el('span', 'ap-val', opened + '/' + total));
     pm.appendChild(el('span', 'ap-lab', 'прогресс'));
     prof.appendChild(pm);
+    prof.onclick = function () { MaxBridge.haptic('light'); showProfile(); };
     nav.appendChild(prof);
 
     bar.appendChild(nav);
@@ -6849,6 +6975,178 @@
     c.appendChild(el('div', 'kpi-val', value));
     c.appendChild(el('div', 'kpi-lab', label));
     return c;
+  }
+
+  /*
+   *  КАРТОЧКА ПРОФИЛЯ
+   *
+   *  Всё, что игра знает об игроке: рекорды, место в общей таблице, прогресс.
+   *  Заодно честная проверка связи: строка состояния прямо говорит, взяты
+   *  данные с сервера или только из памяти этого устройства.
+   */
+  function pfTile(value, label, tone) {
+    var c = el('div', 'pf-tile' + (tone ? ' ' + tone : ''));
+    c.appendChild(el('div', 'pf-val', value));
+    c.appendChild(el('div', 'pf-lab', label));
+    return c;
+  }
+
+  function localProfile() {
+    var runs = Store.data.runs || [];
+    var best = 0, bestTitle = '';
+    runs.forEach(function (r) {
+      if ((r.score || 0) > best) { best = r.score || 0; bestTitle = r.title || ''; }
+    });
+    return {
+      runs: runs.length,
+      best: best,
+      bestTitle: bestTitle,
+      concepts: (Store.data.concepts || []).length,
+      conceptsTotal: Object.keys(C.concepts).length,
+      forecast: Store.avgForecastError()
+    };
+  }
+
+  function showProfile() {
+    var who = Leaders.me();
+    var local = localProfile();
+
+    var wrap = el('div', 'modal-wrap');
+    var m = el('div', 'modal profile-modal');
+
+    var k = el('div', 'modal-kicker');
+    k.appendChild(icon('user'));
+    k.appendChild(el('span', null, 'профиль'));
+    m.appendChild(k);
+
+    m.appendChild(el('h3', 'modal-title', who.name || 'Игрок'));
+
+    var status = el('div', 'pf-status');
+    var dot = el('i', 'pf-dot');
+    status.appendChild(dot);
+    var statusText = el('span', 'pf-status-txt', 'Данные с этого устройства');
+    status.appendChild(statusText);
+    m.appendChild(status);
+
+    var grid = el('div', 'pf-grid');
+    var tBest = pfTile(local.best ? String(local.best) : '—', 'лучший балл', local.best ? 'good' : '');
+    var tRank = pfTile('—', 'место в таблице');
+    var tRuns = pfTile(String(local.runs), plural(local.runs, 'партия', 'партии', 'партий'));
+    var tKnow = pfTile(local.concepts + '/' + local.conceptsTotal, 'карточек знаний');
+    [tBest, tRank, tRuns, tKnow].forEach(function (t) { grid.appendChild(t); });
+    m.appendChild(grid);
+
+    if (local.forecast != null) {
+      var acc = el('div', 'pf-line');
+      acc.appendChild(el('span', 'pf-line-lab', 'Точность прогнозов'));
+      acc.appendChild(el('span', 'pf-line-val',
+        'ошибка ' + Math.round(local.forecast * 100) + '%'));
+      m.appendChild(acc);
+    }
+
+    var listBox = el('div', 'pf-list-box');
+    listBox.appendChild(el('div', 'section-label', 'Лучшее по сценариям'));
+    var list = el('div', 'pf-list');
+    listBox.appendChild(list);
+    m.appendChild(listBox);
+
+    function fillList(rows) {
+      list.innerHTML = '';
+      if (!rows.length) {
+        list.appendChild(el('div', 'pf-empty', 'Пока ни одной законченной партии.'));
+        return;
+      }
+      rows.slice(0, 8).forEach(function (r) {
+        var row = el('div', 'pf-row');
+        row.appendChild(el('span', 'pf-row-name', r.title || r.scenarioId));
+        var right = el('span', 'pf-row-right');
+        if (r.grade) right.appendChild(el('span', 'pf-grade', r.grade));
+        right.appendChild(el('span', 'pf-row-score', String(r.score)));
+        row.appendChild(right);
+        list.appendChild(row);
+      });
+    }
+
+    // Локальные данные показываем сразу — экран не должен ждать сеть.
+    var localRows = {};
+    (Store.data.runs || []).forEach(function (r) {
+      var cur = localRows[r.scenarioId];
+      if (!cur || (r.score || 0) > cur.score) {
+        localRows[r.scenarioId] = { scenarioId: r.scenarioId, title: r.title, score: r.score || 0, grade: r.grade };
+      }
+    });
+    var localList = Object.keys(localRows).map(function (id) { return localRows[id]; })
+      .sort(function (a, b) { return b.score - a.score; });
+    fillList(localList);
+
+    var close = el('button', 'primary-btn');
+    close.appendChild(el('span', null, 'Понятно'));
+    function shutProfile() {
+      wrap.classList.remove('in');
+      lockScroll(false);
+      setTimeout(function () { wrap.remove(); }, 220);
+      document.removeEventListener('keydown', onKey);
+    }
+    function onKey(e) { if (e.key === 'Escape') shutProfile(); }
+    close.onclick = shutProfile;
+    m.appendChild(close);
+
+    wrap.appendChild(m);
+    wrap.onclick = function (e) { if (e.target === wrap) shutProfile(); };
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(wrap);
+    lockScroll(true);
+    requestAnimationFrame(function () { wrap.classList.add('in'); });
+
+    /* Серверная часть: если игра открыта в MAX и связь есть, цифры
+       заменяются на общие — вместе с местом в таблице. */
+    var P = window.FylProfile;
+    if (!P || !P.load) {
+      statusText.textContent = 'Игра открыта вне MAX: результаты только на этом устройстве';
+      status.classList.add('local');
+      return;
+    }
+
+    status.classList.add('wait');
+    statusText.textContent = 'Проверяем связь с сервером…';
+
+    P.load().then(function (data) {
+      if (!data || !data.ok) throw new Error(data && data.error ? data.error : 'нет ответа');
+      var st = data.stats || {};
+      status.classList.remove('wait');
+      status.classList.add('online');
+      statusText.textContent = 'Профиль синхронизирован с сервером';
+      if (data.player && data.player.name) {
+        var titleNode = m.querySelector('.modal-title');
+        if (titleNode) titleNode.textContent = data.player.name;
+      }
+      if (st.best != null) {
+        tBest.querySelector('.pf-val').textContent = String(st.best);
+        tBest.classList.add('good');
+      }
+      if (st.rank != null) {
+        tRank.querySelector('.pf-val').textContent = String(st.rank);
+        tRank.querySelector('.pf-lab').textContent =
+          st.players ? 'место из ' + st.players : 'место в таблице';
+      }
+      if (st.runs != null) {
+        tRuns.querySelector('.pf-val').textContent = String(st.runs);
+        tRuns.querySelector('.pf-lab').textContent = plural(st.runs, 'партия', 'партии', 'партий');
+      }
+      if (st.concepts != null) {
+        tKnow.querySelector('.pf-val').textContent = st.concepts + '/' + local.conceptsTotal;
+      }
+      var rows = (data.best || []).map(function (b) {
+        var sc = C.scenarios.filter(function (x) { return x.id === b.scenario_id; })[0];
+        return { scenarioId: b.scenario_id, title: sc ? sc.title : b.scenario_id, score: b.score, grade: b.grade };
+      }).sort(function (a, b) { return b.score - a.score; });
+      if (rows.length) fillList(rows);
+    }).catch(function (e) {
+      status.classList.remove('wait');
+      status.classList.add('offline');
+      statusText.textContent = 'Сервер недоступен: показаны данные этого устройства';
+      if (window.console && console.warn) console.warn('профиль:', e);
+    });
   }
 
   function showConceptModal(id) {

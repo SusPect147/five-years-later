@@ -65,13 +65,31 @@ function safeEqual(a: string, b: string) {
 
 type MaxUser = { user_id: number; name?: string; username?: string };
 
+/*
+ * Почему подпись не сошлась — самая частая причина молчаливого 401.
+ * Здесь остаётся разбор последней неудачной проверки: сам токен и
+ * значения параметров сюда не попадают, только форма запроса.
+ */
+let lastAuthDiag: Record<string, unknown> = {};
+
 async function verifyLaunchParams(raw: string): Promise<MaxUser | null> {
-  if (!raw || typeof raw !== 'string' || raw.length > 4096) return null;
-  if (!BOT_TOKEN) return null;
+  lastAuthDiag = { token_set: !!BOT_TOKEN, raw_len: raw ? raw.length : 0 };
+  if (!raw || typeof raw !== 'string' || raw.length > 4096) {
+    lastAuthDiag.reason = 'нет параметров запуска';
+    return null;
+  }
+  if (!BOT_TOKEN) {
+    lastAuthDiag.reason = 'не задан секрет MAX_BOT_TOKEN';
+    return null;
+  }
 
   const params = new URLSearchParams(raw);
   const hash = params.get('hash');
-  if (!hash) return null;
+  lastAuthDiag.keys = [...params.keys()].sort();
+  if (!hash) {
+    lastAuthDiag.reason = 'в параметрах нет hash';
+    return null;
+  }
 
   const pairs: string[] = [];
   for (const [k, v] of params.entries()) {
@@ -83,20 +101,37 @@ async function verifyLaunchParams(raw: string): Promise<MaxUser | null> {
 
   const secretKey = await hmac(enc.encode('WebAppData'), BOT_TOKEN);
   const signature = toHex(await hmac(new Uint8Array(secretKey), checkString));
-  if (!safeEqual(signature, hash.toLowerCase())) return null;
+  if (!safeEqual(signature, hash.toLowerCase())) {
+    lastAuthDiag.reason = 'подпись не совпала';
+    lastAuthDiag.got = hash.slice(0, 10);
+    lastAuthDiag.want = signature.slice(0, 10);
+    return null;
+  }
 
   // Просроченный запуск не принимаем: перехваченные параметры не должны
   // работать вечно.
   const authDate = Number(params.get('auth_date') || 0);
-  if (!authDate) return null;
+  if (!authDate) {
+    lastAuthDiag.reason = 'нет auth_date';
+    return null;
+  }
   const ageSec = Math.abs(Date.now() / 1000 - (authDate > 1e11 ? authDate / 1000 : authDate));
-  if (ageSec > 60 * 60 * 24) return null;
+  if (ageSec > 60 * 60 * 24) {
+    lastAuthDiag.reason = 'параметры запуска просрочены';
+    lastAuthDiag.age_hours = Math.round(ageSec / 360) / 10;
+    return null;
+  }
 
   try {
     const user = JSON.parse(params.get('user') || 'null');
-    if (!user || typeof user.user_id !== 'number') return null;
+    if (!user || typeof user.user_id !== 'number') {
+      lastAuthDiag.reason = 'в параметрах нет user.user_id';
+      return null;
+    }
+    lastAuthDiag = {};
     return user as MaxUser;
   } catch {
+    lastAuthDiag.reason = 'user не разбирается как JSON';
     return null;
   }
 }
@@ -419,15 +454,17 @@ async function leaderboard(body: any) {
 
 async function getProgress(user: MaxUser) {
   const player = await getPlayer(user);
-  const [{ data: progress }, { data: best }] = await Promise.all([
+  const [{ data: progress }, { data: best }, { data: stats }] = await Promise.all([
     db.from('progress').select('concepts, scenarios_played, runs_count').eq('player_id', player.id).maybeSingle(),
-    db.from('best_scores').select('scenario_id, score, grade').eq('player_id', player.id),
+    db.from('best_scores').select('scenario_id, score, grade').eq('player_id', player.id).order('score', { ascending: false }),
+    db.rpc('player_stats', { p_player: player.id }),
   ]);
   return json({
     ok: true,
     player: { id: String(user.user_id), name: player.name },
     progress: progress ?? { concepts: [], scenarios_played: [], runs_count: 0 },
     best: best ?? [],
+    stats: stats ?? null,
   });
 }
 
@@ -460,7 +497,7 @@ Deno.serve(async (req) => {
       user = { user_id: Number(body.dev_user_id), name: String(body.dev_name ?? 'Тестер') };
     }
     if (!user) {
-      await logSecurity(null, 'bad_signature', { action });
+      await logSecurity(null, 'bad_signature', { action, ...lastAuthDiag });
       return json({ error: 'unauthorized' }, 401);
     }
 

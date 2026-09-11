@@ -24,9 +24,25 @@
   var B = window.GameBridge;
   if (!B || !B.Leaders) return;
 
+  /*
+   * Подписанные параметры запуска MAX кладёт во фрагмент адреса (после #).
+   * Мост window.WebApp в разных версиях отдаёт их по-разному, поэтому берём
+   * первое, что похоже на подписанную строку: в ней обязательно есть hash=.
+   */
   function launchParams() {
     var W = window.WebApp;
-    return (W && (W.initData || W.initDataRaw)) || '';
+    var candidates = [
+      (location.hash || '').replace(/^#/, ''),
+      (location.search || '').replace(/^\?/, ''),
+      W && typeof W.initData === 'string' ? W.initData : '',
+      W && typeof W.initDataRaw === 'string' ? W.initDataRaw : '',
+      W && typeof W.launchParams === 'string' ? W.launchParams : ''
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+      var c = candidates[i];
+      if (c && c.indexOf('hash=') >= 0) return c;
+    }
+    return '';
   }
 
   function post(payload) {
@@ -152,7 +168,21 @@
   if (!launchParams()) return;
 
   B.Leaders.use(serverSource);
-  refreshBoard();
-  pullProgress();
+
+  /*
+   * Карточка профиля в игре берёт данные отсюда. Наличие этого объекта —
+   * признак того, что игра открыта в MAX и серверу есть что спросить.
+   */
+  window.FylProfile = {
+    online: true,
+    load: function () { return post({ action: 'progress' }); }
+  };
+
+  /*
+   * Экран загрузки ждёт этот промис: пока идут первые запросы к серверу,
+   * шкала честно показывает, что ещё не всё готово.
+   */
+  window.FylBoot = Promise.all([refreshBoard(), pullProgress()]);
+
   flushQueue();
 })();
