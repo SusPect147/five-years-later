@@ -122,18 +122,44 @@ async function verifyLaunchParams(raw: string): Promise<MaxUser | null> {
     return null;
   }
 
+  let raw_user: any;
   try {
-    const user = JSON.parse(params.get('user') || 'null');
-    if (!user || typeof user.user_id !== 'number') {
-      lastAuthDiag.reason = 'в параметрах нет user.user_id';
-      return null;
-    }
-    lastAuthDiag = {};
-    return user as MaxUser;
+    raw_user = JSON.parse(params.get('user') || 'null');
   } catch {
     lastAuthDiag.reason = 'user не разбирается как JSON';
     return null;
   }
+  const user = normalizeUser(raw_user);
+  if (!user) {
+    lastAuthDiag.reason = 'в параметрах нет user.id';
+    lastAuthDiag.user_keys = raw_user && typeof raw_user === 'object' ? Object.keys(raw_user).sort() : null;
+    return null;
+  }
+  lastAuthDiag = {};
+  return user;
+}
+
+/*
+ * В мини-приложении MAX (initData) пользователь приходит в формате
+ * { id, first_name, last_name, username, ... } — как в Telegram.
+ * А в Bot API (вебхуки бота) тот же человек выглядит как { user_id, name }.
+ * Раньше здесь ждали только user_id, поэтому каждый честный запуск из MAX
+ * отбивался с 401. Теперь принимаем оба формата и приводим к одному.
+ */
+function normalizeUser(u: any): MaxUser | null {
+  if (!u || typeof u !== 'object') return null;
+  const rawId = u.id ?? u.user_id;
+  const id = typeof rawId === 'string' && /^\d+$/.test(rawId) ? Number(rawId) : rawId;
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return null;
+  const fullName = [u.first_name, u.last_name]
+    .filter((x) => typeof x === 'string' && x.trim())
+    .join(' ')
+    .trim();
+  return {
+    user_id: id,
+    name: fullName || (typeof u.name === 'string' ? u.name : '') || (u.username ? String(u.username) : ''),
+    username: typeof u.username === 'string' && u.username ? u.username : undefined,
+  };
 }
 
 /* ================================================================
