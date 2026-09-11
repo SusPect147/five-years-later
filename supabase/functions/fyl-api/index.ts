@@ -16,6 +16,8 @@ const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const BOT_TOKEN = Deno.env.get('MAX_BOT_TOKEN') ?? '';
 const DEV_ALLOW_UNSIGNED = (Deno.env.get('FYL_DEV_ALLOW_UNSIGNED') ?? '') === '1';
+// Публичное имя бота: из него собирается ссылка-приглашение в мини-приложение.
+const BOT_USERNAME = (Deno.env.get('FYL_BOT_USERNAME') ?? 'id540552561205_1_bot').trim();
 
 const db = createClient(SUPABASE_URL, SERVICE_KEY, {
   auth: { persistSession: false },
@@ -63,7 +65,7 @@ function safeEqual(a: string, b: string) {
   return diff === 0;
 }
 
-type MaxUser = { user_id: number; name?: string; username?: string };
+type MaxUser = { user_id: number; name?: string; username?: string; start_param?: string };
 
 /*
  * Почему подпись не сошлась — самая частая причина молчаливого 401.
@@ -135,6 +137,10 @@ async function verifyLaunchParams(raw: string): Promise<MaxUser | null> {
     lastAuthDiag.user_keys = raw_user && typeof raw_user === 'object' ? Object.keys(raw_user).sort() : null;
     return null;
   }
+  // start_param тоже подписан MAX — по нему честно видно, по чьей ссылке
+  // пришёл игрок. Подделать приглашение, не зная токена бота, нельзя.
+  const startParam = params.get('start_param');
+  if (startParam) user.start_param = startParam.slice(0, 128);
   lastAuthDiag = {};
   return user;
 }
@@ -275,10 +281,83 @@ async function getPlayer(user: MaxUser) {
       },
       { onConflict: 'max_user_id' },
     )
-    .select('id, banned, name')
+    .select('id, banned, name, ref_code, referred_by, referral_qualified_at')
     .single();
   if (error) throw new Error('player: ' + error.message);
   return data;
+}
+
+/* ================================================================
+ * Приглашения друзей
+ *
+ * Ссылка: https://max.ru/<бот>?startapp=ref_<код>. MAX кладёт ref_<код>
+ * в подписанный start_param, поэтому сервер сам видит, кто кого позвал.
+ *
+ * Привязка — только для новичка: у игрока ещё нет ни одной доигранной
+ * партии и его никто раньше не приглашал. Засчитывается приглашение
+ * после первой доигранной партии — пустые заходы по ссылке не считаются.
+ * ================================================================ */
+
+const REF_RE = /^ref_([a-z0-9]{6,16})$/;
+
+async function attachReferral(player: any, user: MaxUser) {
+  const m = REF_RE.exec(String(user.start_param ?? ''));
+  if (!m || player.referred_by) return;
+  const code = m[1];
+  if (code === player.ref_code) return; // по своей ссылке — не считается
+
+  const { count } = await db.from('runs').select('id', { count: 'exact', head: true }).eq('player_id', player.id);
+  if ((count ?? 0) > 0) return; // уже играл — не новичок
+
+  const { data: inviter } = await db.from('players').select('id, referred_by').eq('ref_code', code).maybeSingle();
+  if (!inviter || inviter.id === player.id) return;
+  if (inviter.referred_by === player.id) return; // «пригласили друг друга» не засчитываем
+
+  const { error } = await db.from('players')
+    .update({ referred_by: inviter.id, referred_at: new Date().toISOString() })
+    .eq('id', player.id)
+    .is('referred_by', null);
+  if (error) {
+    await logSecurity(user.user_id, 'referral_failed', { message: error.message.slice(0, 200) });
+    return;
+  }
+  player.referred_by = inviter.id;
+}
+
+async function qualifyReferral(player: any) {
+  if (!player.referred_by || player.referral_qualified_at) return;
+  const now = new Date().toISOString();
+  await db.from('players')
+    .update({ referral_qualified_at: now })
+    .eq('id', player.id)
+    .is('referral_qualified_at', null);
+  player.referral_qualified_at = now;
+}
+
+async function referralInfo(player: any) {
+  const { data: friends } = await db.from('players')
+    .select('name, referred_at, referral_qualified_at')
+    .eq('referred_by', player.id)
+    .order('referred_at', { ascending: false })
+    .limit(50);
+  const list = friends ?? [];
+  const invited = list.filter((f: any) => f.referral_qualified_at).length;
+  let invitedBy: string | null = null;
+  if (player.referred_by) {
+    const { data: inv } = await db.from('players').select('name').eq('id', player.referred_by).maybeSingle();
+    invitedBy = inv?.name || 'Игрок';
+  }
+  return {
+    code: player.ref_code,
+    link: BOT_USERNAME ? `https://max.ru/${BOT_USERNAME}?startapp=ref_${player.ref_code}` : null,
+    invited,
+    pending: list.length - invited,
+    friends: list.slice(0, 20).map((f: any) => ({
+      name: String(f.name || 'Игрок').slice(0, 64),
+      qualified: !!f.referral_qualified_at,
+    })),
+    invited_by: invitedBy,
+  };
 }
 
 async function tooManyRuns(playerId: number) {
@@ -296,6 +375,7 @@ async function tooManyRuns(playerId: number) {
 async function submitRun(user: MaxUser, body: any) {
   const player = await getPlayer(user);
   if (player.banned) return json({ error: 'banned' }, 403);
+  await attachReferral(player, user);
 
   const scenarioId = String(body.scenario_id ?? '').slice(0, 64);
   const seed = String(body.seed ?? '').slice(0, 64);
@@ -410,6 +490,8 @@ async function submitRun(user: MaxUser, body: any) {
     // Прогресс и аналитика.
     await bumpProgress(player.id, scenarioId, st);
     await bumpEventStats(scenarioId, actions);
+    // Первая доигранная партия приглашённого — приглашение засчитано.
+    await qualifyReferral(player);
   }
 
   return json({
@@ -480,10 +562,12 @@ async function leaderboard(body: any) {
 
 async function getProgress(user: MaxUser) {
   const player = await getPlayer(user);
-  const [{ data: progress }, { data: best }, { data: stats }] = await Promise.all([
+  await attachReferral(player, user);
+  const [{ data: progress }, { data: best }, { data: stats }, referral] = await Promise.all([
     db.from('progress').select('concepts, scenarios_played, runs_count').eq('player_id', player.id).maybeSingle(),
     db.from('best_scores').select('scenario_id, score, grade').eq('player_id', player.id).order('score', { ascending: false }),
     db.rpc('player_stats', { p_player: player.id }),
+    referralInfo(player),
   ]);
   return json({
     ok: true,
@@ -491,6 +575,7 @@ async function getProgress(user: MaxUser) {
     progress: progress ?? { concepts: [], scenarios_played: [], runs_count: 0 },
     best: best ?? [],
     stats: stats ?? null,
+    referral,
   });
 }
 

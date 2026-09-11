@@ -156,6 +156,14 @@
       if (!res || !res.ok) return;
       var ids = (res.progress && res.progress.concepts) || [];
       if (ids.length && B.Store && B.Store.learnAll) B.Store.learnAll(ids);
+      // Приглашённые друзья: число с сервера открывает значки «За друзей»
+      // и запоминается, чтобы профиль показал ссылку сразу.
+      var ref = res.referral;
+      if (ref && B.Store) {
+        B.Store.data.referral = { link: ref.link || null, invited: ref.invited | 0, pending: ref.pending | 0 };
+        B.Store.save();
+        if (B.Achievements && B.Achievements.syncInvites) B.Achievements.syncInvites(ref.invited);
+      }
     }).catch(function () { /* не критично */ });
   }
 

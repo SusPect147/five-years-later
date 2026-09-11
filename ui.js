@@ -304,6 +304,8 @@
     refresh: '<path d="M19.5 12a7.5 7.5 0 1 1-2.3-5.4"/><path d="M19.8 4.5v4.2h-4.2"/>',
     flag: '<path d="M6 20.5V4"/><path d="M6 5.2h11l-2.4 3.6L17 12.4H6z"/>',
     alert: '<path d="M12 4.5 3 19.5h18z"/><path d="M12 10v4M12 16.8h.01"/>',
+    users: '<circle cx="9" cy="8" r="3.2"/><path d="M3.5 19.5c.6-3.2 2.8-5 5.5-5s4.9 1.8 5.5 5"/><circle cx="17" cy="9" r="2.4"/><path d="M16.2 14.6c2.3.1 3.9 1.7 4.3 4.4"/>',
+    copy: '<rect x="8.5" y="8.5" width="11" height="11" rx="2.2"/><path d="M15.5 8.5V6.2a1.7 1.7 0 0 0-1.7-1.7H6.2a1.7 1.7 0 0 0-1.7 1.7v7.6a1.7 1.7 0 0 0 1.7 1.7h2.3"/>',
     share: '<circle cx="17.5" cy="6" r="2.5"/><circle cx="6.5" cy="12" r="2.5"/><circle cx="17.5" cy="18" r="2.5"/><path d="m8.8 10.8 6.4-3.6M8.8 13.2l6.4 3.6"/>',
     trash: '<path d="M4.5 7h15"/><path d="M9.5 7V5.2h5V7"/><path d="M6.6 7l.9 12.3h9l.9-12.3"/>',
     lock: '<rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8.3 10.5V8.2a3.7 3.7 0 0 1 7.4 0v2.3"/>',
@@ -389,6 +391,28 @@
     return b;
   }
 
+  /** Скопировать текст: сначала современным способом, потом старым. */
+  function copyText(text) {
+    function legacy() {
+      var ok = false;
+      feature(function () {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:-1000px;left:0;opacity:0';
+        document.body.appendChild(ta);
+        ta.select();
+        ok = document.execCommand('copy');
+        ta.remove();
+      });
+      return ok;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).then(function () { return true; }, function () { return legacy(); });
+    }
+    return Promise.resolve(legacy());
+  }
+
   /* Мост к MAX (работает и без него — в обычном браузере) */
 
   var MaxBridge = {
@@ -433,6 +457,42 @@
       // (страница открыта не по https), и это не поломка игры.
       feature(function () { return navigator.clipboard.writeText(text); });
       return false;
+    },
+
+    /**
+     * Поделиться ссылкой-приглашением. Внутри MAX открывается выбор чата
+     * (shareMaxContent), на телефоне вне MAX — системное меню «Поделиться»,
+     * а если нет и его — ссылка просто копируется. Промис говорит, чем
+     * всё кончилось: 'max' | 'native' | 'copied' | 'failed'.
+     */
+    shareLink: function (text, link) {
+      var W = window.WebApp;
+      function copyFallback() {
+        return copyText(text + '\n' + link).then(function (ok) { return ok ? 'copied' : 'failed'; });
+      }
+      function attempt(fn) {
+        try {
+          var r = fn();
+          return Promise.resolve(r);
+        } catch (e) { return Promise.reject(e); }
+      }
+      if (W && typeof W.shareMaxContent === 'function') {
+        return attempt(function () { return W.shareMaxContent({ text: text, link: link }); })
+          .then(function () { return 'max'; }, copyFallback);
+      }
+      if (W && typeof W.shareContent === 'function') {
+        return attempt(function () { return W.shareContent({ text: text, link: link }); })
+          .then(function () { return 'native'; }, copyFallback);
+      }
+      if (navigator.share) {
+        return attempt(function () { return navigator.share({ title: 'Пять лет спустя', text: text, url: link }); })
+          .then(function () { return 'native'; }, function (e) {
+            // Пользователь сам закрыл меню — это не повод копировать молча.
+            if (e && e.name === 'AbortError') return 'cancelled';
+            return copyFallback();
+          });
+      }
+      return copyFallback();
     },
 
     backButton: function (show, handler) {
@@ -1098,6 +1158,8 @@
       document.removeEventListener('keydown', onKey);
       if (onMove) document.removeEventListener('mousemove', onMove);
       renderMenu();
+      // Заставка ушла: если это компьютер с узким окном — подсказываем.
+      SizeGuard.maybeShow();
     }
     function onKey(e) {
       if (e.key === 'Enter' || e.key === 'Escape' || e.key === ' ') {
@@ -5757,6 +5819,18 @@
    */
 
   var ACHIEVEMENTS = [
+    /* --- За друзей: открываются по приглашениям, а не по итогу партии.
+           Друг засчитывается, когда доиграл свою первую партию. --- */
+    { id: 'friend-1', title: 'Позвал друга', social: true, need: 1,
+      hint: 'Пригласить друга, который доиграет свою первую партию',
+      test: function (c) { return c.invited >= 1; } },
+    { id: 'friend-3', title: 'Своя компания', social: true, need: 3,
+      hint: 'Три приглашённых друга доиграли первую партию',
+      test: function (c) { return c.invited >= 3; } },
+    { id: 'friend-10', title: 'Душа компании', social: true, hard: true, need: 10,
+      hint: 'Десять приглашённых друзей доиграли первую партию',
+      test: function (c) { return c.invited >= 10; } },
+
     /* --- Обычные: отмечают, что игрок понял правило --- */
     { id: 'finish', title: 'Пять лет спустя', hint: 'Доиграть партию до конца',
       test: function (c) { return c.finished; } },
@@ -5877,12 +5951,29 @@
         conceptsTotal: Object.keys(C.concepts).length,
         runs: d.runs.length,
         runsList: d.runs,
+        invited: d.invited || 0,
         elapsed: G.startedAt ? Date.now() - G.startedAt : 0
       };
     }
 
+    /** Достижения за друзей: считаются по данным сервера, без партии. */
+    function syncInvites(n) {
+      n = Math.max(0, Math.floor(Number(n) || 0));
+      var d = Store.data;
+      if (d.invited !== n) { d.invited = n; Store.save(); }
+      var got = have(), fresh = [];
+      ACHIEVEMENTS.forEach(function (a) {
+        if (!a.social || got.indexOf(a.id) !== -1) return;
+        if (n >= a.need) { got.push(a.id); fresh.push(a); }
+      });
+      if (fresh.length) Store.save();
+      return fresh;
+    }
+
     return {
       all: function () { return ACHIEVEMENTS; },
+      syncInvites: syncInvites,
+      social: function () { return ACHIEVEMENTS.filter(function (a) { return a.social; }); },
       unlocked: function () { return have().slice(); },
       has: function (id) { return have().indexOf(id) !== -1; },
       /** Проверить всё и вернуть только что открытые. */
@@ -5890,7 +5981,7 @@
         var ctx = context(extra);
         var got = have(), fresh = [];
         ACHIEVEMENTS.forEach(function (a) {
-          if (got.indexOf(a.id) !== -1) return;
+          if (got.indexOf(a.id) !== -1 || a.social) return;
           var ok = false;
           try { ok = !!a.test(ctx); }
           catch (e) { Fail.report('Достижение «' + a.title + '» не проверилось', e); }
@@ -5907,7 +5998,7 @@
   function achCard(a, unlocked) {
     var secret = a.secret && !unlocked;
     var card = el('article', 'ach' + (unlocked ? ' on' : '') +
-      (a.hard ? ' hard' : '') + (a.secret ? ' secret' : ''));
+      (a.hard ? ' hard' : '') + (a.secret ? ' secret' : '') + (a.social ? ' social' : ''));
 
     var mark = el('div', 'ach-mark');
     mark.appendChild(icon(unlocked ? 'check' : secret ? 'help' : 'lock'));
@@ -5920,7 +6011,8 @@
       : a.hint));
     card.appendChild(body);
 
-    if (a.hard) card.appendChild(el('span', 'ach-tag', 'сложное'));
+    if (a.social) card.appendChild(el('span', 'ach-tag social', 'друзья'));
+    else if (a.hard) card.appendChild(el('span', 'ach-tag', 'сложное'));
     else if (a.secret) card.appendChild(el('span', 'ach-tag secret', 'секретное'));
     return card;
   }
@@ -5951,8 +6043,9 @@
     counter.appendChild(track);
     wrap.appendChild(counter);
 
-    [['Обычные', function (a) { return !a.hard && !a.secret; }],
-     ['Сложные', function (a) { return a.hard; }],
+    [['Обычные', function (a) { return !a.hard && !a.secret && !a.social; }],
+     ['Сложные', function (a) { return a.hard && !a.social; }],
+     ['За друзей', function (a) { return a.social; }],
      ['Секретные', function (a) { return a.secret; }]].forEach(function (group) {
       var list = all.filter(group[1]);
       if (!list.length) return;
@@ -7007,6 +7100,399 @@
     };
   }
 
+  /*
+   *  УЗКОЕ ОКНО НА КОМПЬЮТЕРЕ
+   *
+   *  Игра открыта с компьютера, а окно браузера сжато до «телефонного»:
+   *  узкое или вертикальное. Телефонная вёрстка при этом работает, но
+   *  на компьютере играть в ней неудобно — половина экрана пустует.
+   *  После заставки показываем подсказку: анимация на пять секунд, где
+   *  курсор тянет окно за углы и оно становится альбомным, и просьба
+   *  перезагрузить страницу, не закрывая её.
+   *
+   *  Компьютер распознаётся по нескольким признакам сразу, а не по
+   *  ширине окна: платформа MAX, подсказки браузера (userAgentData),
+   *  строка браузера, указатель-мышь с наведением. Если сам монитор
+   *  узкий и растянуть окно некуда — подсказку не показываем.
+   */
+  var SizeGuard = (function () {
+    var MIN_W = 900;
+    var SKIP_KEY = 'fin-sim-narrow-ok';
+    var shown = false;
+
+    function mq(q) { return feature(function () { return window.matchMedia(q).matches; }, false); }
+
+    function isDesktop() {
+      var W = window.WebApp;
+      var plat = W && W.platform;
+      if (plat === 'ios' || plat === 'android') return false;
+      var uad = navigator.userAgentData;
+      if (uad && uad.mobile === true) return false;
+      var ua = navigator.userAgent || '';
+      if (/Android|iPhone|iPad|iPod|Mobile|Windows Phone|Opera Mini|IEMobile|Silk|Kindle/i.test(ua)) return false;
+      // iPad притворяется Mac, но выдаёт себя сенсорным экраном
+      if (/Macintosh/.test(ua) && (navigator.maxTouchPoints || 0) > 1) return false;
+      // Главный указатель — мышь или тачпад с наведением
+      if (!(mq('(pointer:fine)') && mq('(hover:hover)'))) return false;
+      return true;
+    }
+
+    function screenPortrait() {
+      var sw = (window.screen && (screen.availWidth || screen.width)) || 0;
+      var sh = (window.screen && (screen.availHeight || screen.height)) || 0;
+      return sw && sh && sw < sh;
+    }
+
+    /** Окно «как у телефона»: узкое или вертикальное. */
+    function narrow() {
+      var w = window.innerWidth, h = window.innerHeight;
+      if (w < MIN_W) return true;
+      return !screenPortrait() && w < h;
+    }
+
+    /** Есть ли куда растянуть: монитор шире нужного и шире окна. */
+    function canGrow() {
+      var sw = (window.screen && (screen.availWidth || screen.width)) || 0;
+      if (!sw) return true;
+      return sw >= MIN_W && sw > window.innerWidth + 40;
+    }
+
+    function skipped() {
+      return feature(function () { return sessionStorage.getItem(SKIP_KEY) === '1'; }, false);
+    }
+
+    function should() {
+      return !shown && !skipped() && isDesktop() && narrow() && canGrow();
+    }
+
+    function svgCursor() {
+      return '<svg class="sg-cur-arrow" viewBox="0 0 24 24" aria-hidden="true">' +
+        '<path d="M5 3l13 8.6-6 1.3 3.6 6.8-2.6 1.3-3.6-6.8L5 18.6z" fill="#fff" stroke="#1d1a16" stroke-width="1.6" stroke-linejoin="round"/></svg>' +
+        '<svg class="sg-cur-resize" viewBox="0 0 24 24" aria-hidden="true">' +
+        '<path d="M4 4h6.5L8.2 6.3l9.5 9.5L20 13.5V20h-6.5l2.3-2.3-9.5-9.5L4 10.5z" fill="#fff" stroke="#1d1a16" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+    }
+
+    function miniWindow() {
+      var win = el('div', 'sg-win');
+      var bar = el('div', 'sg-win-bar');
+      bar.appendChild(el('i')); bar.appendChild(el('i')); bar.appendChild(el('i'));
+      win.appendChild(bar);
+      // Вертикальная раскладка: всё друг под другом
+      var por = el('div', 'sg-lay sg-por');
+      por.appendChild(el('b', 'sg-blk h'));
+      por.appendChild(el('b', 'sg-blk big'));
+      por.appendChild(el('b', 'sg-blk'));
+      por.appendChild(el('b', 'sg-blk'));
+      win.appendChild(por);
+      // Альбомная: карта решения и боковая панель рядом
+      var lan = el('div', 'sg-lay sg-lan');
+      var main = el('div', 'sg-col main');
+      main.appendChild(el('b', 'sg-blk h'));
+      main.appendChild(el('b', 'sg-blk big'));
+      var side = el('div', 'sg-col side');
+      side.appendChild(el('b', 'sg-blk'));
+      side.appendChild(el('b', 'sg-blk'));
+      side.appendChild(el('b', 'sg-blk'));
+      lan.appendChild(main); lan.appendChild(side);
+      win.appendChild(lan);
+      var ok = el('span', 'sg-ok');
+      ok.appendChild(icon('check'));
+      win.appendChild(ok);
+      return win;
+    }
+
+    function show() {
+      shown = true;
+      var wrap = el('div', 'sg-wrap');
+      wrap.setAttribute('role', 'dialog');
+      wrap.setAttribute('aria-modal', 'true');
+      wrap.setAttribute('aria-labelledby', 'sg-title');
+
+      var card = el('div', 'sg-card');
+      var k = el('div', 'modal-kicker');
+      k.appendChild(icon('alert'));
+      var kText = el('span', null, 'окно слишком узкое');
+      k.appendChild(kText);
+      card.appendChild(k);
+      var title = el('h2', 'sg-title', 'Пожалуйста, для комфорта игры увеличьте размеры экрана');
+      title.id = 'sg-title';
+      card.appendChild(title);
+
+      // Сцена: окно-«телефон» растягивают за углы в альбомное
+      var stage = el('div', 'sg-stage');
+      stage.appendChild(miniWindow());
+      var cur = el('div', 'sg-cursor');
+      cur.innerHTML = svgCursor();
+      stage.appendChild(cur);
+      card.appendChild(stage);
+      var replay = el('button', 'link-btn sg-replay', 'Показать ещё раз');
+      replay.setAttribute('type', 'button');
+      replay.onclick = function () {
+        stage.classList.remove('play');
+        void stage.offsetWidth; // перезапуск CSS-анимации
+        stage.classList.add('play');
+      };
+      card.appendChild(replay);
+
+      // Два шага: растянуть — перезагрузить
+      var steps = el('ol', 'sg-steps');
+      var s1 = el('li', 'sg-step');
+      s1.appendChild(el('span', 'sg-num', '1'));
+      var s1t = el('div', 'sg-step-body');
+      s1t.appendChild(el('div', 'sg-step-title', 'Растяните окно браузера'));
+      s1t.appendChild(el('div', 'sg-step-text',
+        'Потяните за угол, пока окно не станет альбомным, или разверните его на весь экран.'));
+      var size = el('div', 'sg-size');
+      s1t.appendChild(size);
+      s1.appendChild(s1t);
+      steps.appendChild(s1);
+
+      var s2 = el('li', 'sg-step');
+      s2.appendChild(el('span', 'sg-num', '2'));
+      var s2t = el('div', 'sg-step-body');
+      s2t.appendChild(el('div', 'sg-step-title', 'Перезагрузите страницу, не закрывая её'));
+      s2t.appendChild(el('div', 'sg-step-text',
+        'Кнопкой ниже или клавишами F5 / Ctrl+R — так игра соберётся под новый размер.'));
+      s2.appendChild(s2t);
+      steps.appendChild(s2);
+      card.appendChild(steps);
+
+      var reload = el('button', 'primary-btn sg-reload');
+      reload.setAttribute('type', 'button');
+      reload.appendChild(icon('refresh'));
+      reload.appendChild(el('span', null, 'Перезагрузить страницу'));
+      reload.onclick = function () { feature(function () { location.reload(); }); };
+      card.appendChild(reload);
+
+      var stay = el('button', 'link-btn sg-stay', 'Продолжить в узком окне');
+      stay.setAttribute('type', 'button');
+      stay.onclick = function () {
+        feature(function () { sessionStorage.setItem(SKIP_KEY, '1'); });
+        close();
+      };
+      card.appendChild(stay);
+
+      wrap.appendChild(card);
+
+      function paint() {
+        var w = window.innerWidth, h = window.innerHeight;
+        var good = !narrow();
+        size.textContent = 'Сейчас окно ' + w + ' × ' + h + (good ? ' — отлично, так удобно' : ' — пока узковато');
+        size.classList.toggle('good', good);
+        wrap.classList.toggle('ready', good);
+        s1.classList.toggle('done', good);
+        s2.classList.toggle('now', good);
+        kText.textContent = good ? 'размер подходит' : 'окно слишком узкое';
+        stay.textContent = good ? 'Продолжить без перезагрузки' : 'Продолжить в узком окне';
+      }
+      var rt = 0;
+      function onResize() { clearTimeout(rt); rt = setTimeout(paint, 60); }
+      function onKey(e) { if (e.key === 'Escape') stay.onclick(); }
+      function close() {
+        window.removeEventListener('resize', onResize);
+        document.removeEventListener('keydown', onKey);
+        wrap.classList.remove('in');
+        lockScroll(false);
+        setTimeout(function () { wrap.remove(); }, 220);
+      }
+      window.addEventListener('resize', onResize);
+      document.addEventListener('keydown', onKey);
+      paint();
+
+      document.body.appendChild(wrap);
+      lockScroll(true);
+      requestAnimationFrame(function () {
+        wrap.classList.add('in');
+        stage.classList.add('play');
+        feature(function () { reload.focus({ preventScroll: true }); });
+      });
+    }
+
+    return {
+      isDesktop: isDesktop,
+      narrow: narrow,
+      /** Показать подсказку, если это компьютер с «телефонным» окном. */
+      maybeShow: function () { if (should()) show(); }
+    };
+  })();
+
+  /*
+   *  ПРИГЛАШЕНИЕ ДРУЗЕЙ (блок в профиле)
+   *
+   *  Ссылку выдаёт сервер: https://max.ru/<бот>?startapp=ref_<код>.
+   *  Друг открывает игру по ней, MAX подписывает start_param — и сервер
+   *  знает, кто кого позвал. Засчитывается друг после первой доигранной
+   *  партии: так пустые заходы по ссылке ничего не дают.
+   *
+   *  Пока сервер отвечает, показываем то, что помним с прошлого раза.
+   */
+  function plainLink(link) {
+    return String(link || '').replace(/^https?:\/\//, '');
+  }
+
+  function buildReferralBox() {
+    var box = el('section', 'rf-box');
+
+    var head = el('div', 'rf-head');
+    var ic = el('span', 'rf-ic');
+    ic.appendChild(icon('users'));
+    head.appendChild(ic);
+    var ht = el('div', 'rf-htext');
+    ht.appendChild(el('div', 'rf-title', 'Пригласить друга'));
+    ht.appendChild(el('div', 'rf-sub', 'Друг засчитается, когда доиграет свою первую партию'));
+    head.appendChild(ht);
+    box.appendChild(head);
+
+    // Счётчик и ступени значков: 1, 3, 10 друзей
+    var stats = el('div', 'rf-stats');
+    var num = el('div', 'rf-num', '—');
+    var numLab = el('div', 'rf-num-lab', 'друзей засчитано');
+    var numWrap = el('div', 'rf-count');
+    numWrap.appendChild(num);
+    numWrap.appendChild(numLab);
+    stats.appendChild(numWrap);
+    var steps = el('div', 'rf-steps');
+    var stepNodes = Achievements.social().map(function (a) {
+      var st = el('div', 'rf-step');
+      st.title = a.title + ': ' + a.hint;
+      var dotEl = el('span', 'rf-step-dot');
+      dotEl.appendChild(icon('check'));
+      st.appendChild(dotEl);
+      st.appendChild(el('span', 'rf-step-n', String(a.need)));
+      steps.appendChild(st);
+      return { a: a, node: st };
+    });
+    stats.appendChild(steps);
+    box.appendChild(stats);
+    var pendingLine = el('div', 'rf-pending');
+    pendingLine.hidden = true;
+    box.appendChild(pendingLine);
+
+    // Ссылка и кнопки
+    var linkRow = el('div', 'rf-link');
+    var linkText = el('span', 'rf-url', 'Загружаем вашу ссылку…');
+    linkRow.appendChild(linkText);
+    var copyBtn = el('button', 'rf-copy');
+    copyBtn.setAttribute('type', 'button');
+    copyBtn.setAttribute('aria-label', 'Скопировать ссылку');
+    copyBtn.appendChild(icon('copy'));
+    copyBtn.disabled = true;
+    linkRow.appendChild(copyBtn);
+    box.appendChild(linkRow);
+
+    var shareBtn = el('button', 'primary-btn rf-share');
+    shareBtn.setAttribute('type', 'button');
+    shareBtn.appendChild(icon('share'));
+    shareBtn.appendChild(el('span', null, 'Поделиться ссылкой'));
+    shareBtn.disabled = true;
+    box.appendChild(shareBtn);
+
+    var note = el('div', 'rf-note');
+    note.setAttribute('role', 'status');
+    note.setAttribute('aria-live', 'polite');
+    box.appendChild(note);
+
+    var friendsBox = el('div', 'rf-friends');
+    friendsBox.hidden = true;
+    box.appendChild(friendsBox);
+
+    var byLine = el('div', 'rf-by');
+    byLine.hidden = true;
+    box.appendChild(byLine);
+
+    var link = null;
+    var noteT = 0;
+    function say(text, tone) {
+      note.textContent = text;
+      note.className = 'rf-note show' + (tone ? ' ' + tone : '');
+      clearTimeout(noteT);
+      noteT = setTimeout(function () { note.className = 'rf-note'; }, 3200);
+    }
+
+    function paintSteps(n) {
+      stepNodes.forEach(function (x) { x.node.classList.toggle('on', n >= x.a.need); });
+    }
+
+    function shareText() {
+      return 'Сыграй в «Пять лет спустя» — симулятор взрослой жизни: зарплата, аренда, ' +
+        'кредиты и первые накопления за 20 минут. Проверь, чем кончатся твои пять лет:';
+    }
+
+    shareBtn.onclick = function () {
+      if (!link) return;
+      MaxBridge.haptic('light');
+      MaxBridge.shareLink(shareText(), link).then(function (how) {
+        if (how === 'copied') say('Ссылка скопирована — отправьте её другу', 'good');
+        else if (how === 'failed') say('Не получилось поделиться. Скопируйте ссылку вручную', 'bad');
+      });
+    };
+    copyBtn.onclick = function () {
+      if (!link) return;
+      copyText(link).then(function (ok) {
+        MaxBridge.hapticNotify(ok ? 'success' : 'error');
+        say(ok ? 'Ссылка скопирована' : 'Не получилось скопировать', ok ? 'good' : 'bad');
+      });
+    };
+
+    function update(r) {
+      if (!r) return;
+      link = r.link || null;
+      var n = Math.max(0, r.invited | 0);
+      num.textContent = String(n);
+      numLab.textContent = plural(n, 'друг засчитан', 'друга засчитано', 'друзей засчитано');
+      paintSteps(n);
+      if (link) {
+        linkText.textContent = plainLink(link);
+        copyBtn.disabled = false;
+        shareBtn.disabled = false;
+      }
+      var pend = Math.max(0, r.pending | 0);
+      pendingLine.hidden = !pend;
+      if (pend) {
+        pendingLine.textContent = pend + ' ' + plural(pend, 'друг ещё играет', 'друга ещё играют', 'друзей ещё играют') +
+          ' первую партию';
+      }
+      var fr = r.friends || [];
+      friendsBox.hidden = !fr.length;
+      friendsBox.innerHTML = '';
+      fr.forEach(function (f) {
+        var chip = el('span', 'rf-friend' + (f.qualified ? ' on' : ''));
+        if (f.qualified) chip.appendChild(icon('check'));
+        chip.appendChild(el('span', null, f.name || 'Игрок'));
+        friendsBox.appendChild(chip);
+      });
+      byLine.hidden = !r.invited_by;
+      if (r.invited_by) byLine.textContent = 'Вас пригласил(а) ' + r.invited_by;
+
+      // Запоминаем — в следующий раз блок покажется сразу.
+      Store.data.referral = { link: link, invited: n, pending: pend };
+      var fresh = Achievements.syncInvites(n);
+      if (fresh.length) {
+        MaxBridge.hapticNotify('success');
+        say('Открыто достижение «' + fresh[fresh.length - 1].title + '»', 'good');
+      }
+    }
+
+    // С прошлого раза
+    var cached = Store.data.referral;
+    if (cached) update({ link: cached.link, invited: cached.invited, pending: cached.pending });
+    else paintSteps(Store.data.invited || 0);
+
+    return {
+      node: box,
+      update: update,
+      outside: function () {
+        box.classList.add('off');
+        linkText.textContent = 'Ссылка появится, когда откроете игру в MAX';
+        copyBtn.disabled = true;
+        shareBtn.disabled = true;
+      },
+      offline: function () {
+        if (!link) linkText.textContent = 'Нет связи с сервером — ссылка появится позже';
+      }
+    };
+  }
+
   function showProfile() {
     var who = Leaders.me();
     var local = localProfile();
@@ -7043,6 +7529,9 @@
         'ошибка ' + Math.round(local.forecast * 100) + '%'));
       m.appendChild(acc);
     }
+
+    var ref = buildReferralBox();
+    m.appendChild(ref.node);
 
     var listBox = el('div', 'pf-list-box');
     listBox.appendChild(el('div', 'section-label', 'Лучшее по сценариям'));
@@ -7104,6 +7593,7 @@
     if (!P || !P.load) {
       statusText.textContent = 'Игра открыта вне MAX: результаты только на этом устройстве';
       status.classList.add('local');
+      ref.outside();
       return;
     }
 
@@ -7116,6 +7606,7 @@
       status.classList.remove('wait');
       status.classList.add('online');
       statusText.textContent = 'Профиль синхронизирован с сервером';
+      if (data.referral) ref.update(data.referral);
       if (data.player && data.player.name) {
         var titleNode = m.querySelector('.modal-title');
         if (titleNode) titleNode.textContent = data.player.name;
@@ -7145,6 +7636,7 @@
       status.classList.remove('wait');
       status.classList.add('offline');
       statusText.textContent = 'Сервер недоступен: показаны данные этого устройства';
+      ref.offline();
       if (window.console && console.warn) console.warn('профиль:', e);
     });
   }
@@ -8101,7 +8593,7 @@
     if (param && /^sc_/.test(param)) {
       var id = param.slice(3).replace(/_/g, '-');
       var sc = C.scenarios.filter(function (x) { return x.id === id; })[0];
-      if (sc) { startScenario(sc); return; }
+      if (sc) { startScenario(sc); SizeGuard.maybeShow(); return; }
     }
     // Заставка показывается только при обычном заходе: диплинк ведёт прямо в партию.
     renderSplash();
@@ -8121,6 +8613,8 @@
     state: G,
     Leaders: Leaders,
     Store: Store,
+    Achievements: Achievements,
+    SizeGuard: SizeGuard,
     Max: MaxBridge,
     Content: C,
     Engine: E
