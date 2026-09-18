@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#FFF6E8">
 <!-- Значок вкладки и аватар бота: золотая монета с «5» и растущей линией.
      Вписан прямо в файл, чтобы игра оставалась набором файлов без папки
@@ -49,6 +50,45 @@
     else if (mq.addListener) mq.addListener(follow);
   } catch (e) {}
 })();
+
+/* Верхний безопасный отступ (--sat).
+
+   С viewport-fit=cover браузер сообщает высоту строки состояния через
+   env(safe-area-inset-top), и шапка сдвигается под неё. Но во встроенном
+   браузере мессенджера (MAX на Android) страница начинается НИЖЕ его
+   собственной шапки, а отступ всё равно приходит ненулевым. Итог на
+   телефоне: пустая полоса над шапкой, а кнопки съезжали за её нижнюю
+   кромку. Поэтому отступ учитываем, только когда страница правда
+   залезает под строку состояния: окно почти во весь экран и мы не в MAX. */
+(function () {
+  var root = document.documentElement;
+  // В MAX параметры запуска приходят в адресе, и в них всегда есть hash=
+  var inMax = /hash=|WebAppData/.test((location.hash || '') + (location.search || ''));
+  function update() {
+    try {
+      var b = document.body;
+      if (!b) return;
+      var probe = document.createElement('div');
+      probe.style.cssText = 'position:fixed;top:0;left:0;width:0;visibility:hidden;pointer-events:none;' +
+        'height:env(safe-area-inset-top,0px)';
+      b.appendChild(probe);
+      var inset = probe.getBoundingClientRect().height;
+      b.removeChild(probe);
+      var sw = screen.width || 0, shh = screen.height || 0;
+      // Высота экрана в текущей ориентации (не все браузеры поворачивают screen)
+      var sh = window.innerHeight >= window.innerWidth ? Math.max(sw, shh) : Math.min(sw, shh);
+      // Сколько экрана занято не нашей страницей: строка состояния,
+      // шапка мессенджера, панель навигации.
+      var taken = sh ? sh - window.innerHeight : 0;
+      var fake = inset > 0 && (inMax || taken >= inset + 40);
+      root.classList.toggle('no-sat', fake);
+    } catch (e) {}
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', update);
+  else update();
+  window.addEventListener('resize', update);
+  window.addEventListener('orientationchange', function () { setTimeout(update, 300); });
+})();
 </script>
 <style>
 /* ==================================================================
@@ -66,6 +106,10 @@
    ================================================================== */
 
 :root{
+  /* Верхний безопасный отступ. Во встроенных браузерах, где он ложный,
+     скрипт в <head> ставит .no-sat и обнуляет его. */
+  --sat:env(safe-area-inset-top, 0px);
+
   /* --- Фон и поверхности: кремовая бумага --- */
   --bg:#FFF6E8;
   --bg-2:#FBEDD9;
@@ -4480,7 +4524,19 @@ html.scroll-locked, body.scroll-locked{
 }
 
 /* Полоса-жест снизу и «чёлка» сверху: контент под них не залезает */
-.appbar{padding-top:env(safe-area-inset-top)}
+.appbar{padding-top:var(--sat);height:calc(var(--appbar-h) + var(--sat))}
+html.no-sat{--sat:0px}
+
+/* Android WebView (в том числе внутри MAX) сам «затемняет» светлые
+   страницы, если телефон в тёмной теме: кремовый фон становится чёрным,
+   а синий акцент остаётся — получается ни то ни другое. Объявляем, что
+   у страницы есть своя тёмная тема, и браузер её больше не трогает.
+   Корню — «light dark» (это и выключает затемнение), а содержимому —
+   ровно та схема, что выбрана в игре, чтобы ползунки и поля ввода
+   рисовались в нужных цветах. */
+html{color-scheme:light dark}
+body{color-scheme:light}
+html[data-theme="dark"] body{color-scheme:dark}
 .screen{
   padding-left:max(var(--sp-4), env(safe-area-inset-left));
   padding-right:max(var(--sp-4), env(safe-area-inset-right));
@@ -4587,7 +4643,7 @@ button,.scenario-card,.choice,.lvl-label,.sc-filter,.app-profile{
   /* --- Шапка партии: компактная, в одну-две строки --- */
   .hud{
     padding:var(--sp-2) max(var(--sp-4), env(safe-area-inset-right)) var(--sp-2) max(var(--sp-4), env(safe-area-inset-left));
-    padding-top:calc(var(--sp-2) + env(safe-area-inset-top));
+    padding-top:calc(var(--sp-2) + var(--sat));
     gap:4px var(--sp-3);
   }
   .hud-year{font-size:9.5px;letter-spacing:.14em}
